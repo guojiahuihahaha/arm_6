@@ -1,0 +1,128 @@
+import math
+import time
+from arm_6 import ArmManager  # 导入原本的机械臂驱动类
+
+# ==========================================
+# 核心大脑：根据 PDF 公式写的运动学反解函数
+# ==========================================
+#【⚠️这里的L1 L2需要替换为真实长度！！】
+def pdf_inverse_kinematics(x, y, z, L1=0.25, L2=0.20):
+    """
+    输入想去抓取的空间坐标 (x, y, z)，输出 1, 2, 3, 4 号电机的弧度
+    :param L1: 大臂真实长度（米）
+    :param L2: 小臂真实长度（米）
+    """
+    try:
+        # 1. 求解转台角度 theta (PDF 第6页)
+        theta = math.atan2(y, x)
+
+        # 2. 计算目标点到原点的 3D 空间总距离 OB (PDF 第8页)
+        OB1 = math.sqrt(x**2 + y**2)
+        OB = math.sqrt(x**2 + y**2 + z**2)
+        
+        # 安全检查：如果目标点太远或太近，物理上根本够不到，直接拦截
+        if OB > (L1 + L2) or OB < abs(L1 - L2):
+            print(f"❌ 警告：坐标 ({x}, {y}, {z}) 超过了机械臂的总臂长极限！")
+            return None
+
+        # 3. 求解大臂角度 alpha (PDF 第7页余弦定理)
+        cos_AOB = (L1**2 + OB**2 - L2**2) / (2 * L1 * OB)
+        cos_AOB = max(-1.0, min(1.0, cos_AOB))  # 边界保护
+        angle_AOB = math.acos(cos_AOB)
+        angle_z_OB1 = math.atan2(z, OB1)
+        
+        alpha = (math.pi / 2) - angle_z_OB1 - angle_AOB
+
+        # 4. 求解小臂角度 beta (PDF 第8页余弦定理)
+        cos_OAB = (L1**2 + L2**2 - OB**2) / (2 * L1 * L2)
+        cos_OAB = max(-1.0, min(1.0, cos_OAB))  # 边界保护
+        angle_OAB = math.acos(cos_OAB)
+        
+        beta = (math.pi / 2) - angle_OAB
+
+        # 5. 求解手腕俯仰补偿角 gamma (PDF 第1页)
+        # 作用是让大臂小臂动的时候，手腕自动补偿，保持夹爪永远平行于地面
+        gamma = - (alpha + beta)
+
+        return theta, alpha, beta, gamma
+
+    except Exception as e:
+        print(f"计算出错: {e}")
+        return None
+
+# ==========================================
+# 主程序：在真机旁边的交互流程
+# ==========================================
+def main():
+    # 1. 初始化机械臂（自动连串口、加电机）
+    # ⚠️ 下周记得到 arm_6.py 里把 'COM8' 改成真实的端口！
+    arm = ArmManager()
+    
+    # 2. 设定你机械臂大臂和小臂的真实长度（单位：米）
+    # ⚠️ 下周一到实验室用尺子量一下关节轴心距离，精准修改这里
+    L1_LENGTH = 0.25  
+    L2_LENGTH = 0.20  
+
+    print("\n" + "="*40)
+    print("      达妙 6 轴机械臂【空间坐标控制系统】")
+    print("="*40)
+    
+    # 使能上锁，电机发力顶住
+    print("正在使能 1~6 号电机，使机械臂处于刚性锁定状态...")
+    arm.arm.enable_all_motors()
+    time.sleep(1)
+
+    try:
+        while True:
+            print("\n----------------------------------------")
+            print("请输入你想让机械臂末端（夹爪）前往的空间坐标：")
+            print("提示：单位为米，当前基准是底座中心。退出请输入 ctrl+c")
+            
+            try:
+                user_x = float(input("请输入目标 X (前后距离，单位米，如 0.2): "))
+                user_y = float(input("请输入目标 Y (左右距离，单位米，正为左负为右，如 0.0): "))
+                user_z = float(input("请输入目标 Z (上下高度，单位米，如 0.15): "))
+            except ValueError:
+                print("❌ 输入错误：请输入正确的数字！")
+                continue
+
+            print(f"\n[大脑开始计算...] 目标坐标为: X={user_x}, Y={user_y}, Z={user_z}")
+            
+            # 调用 PDF 的运动学大脑解算度数
+            ik_result = pdf_inverse_kinematics(user_x, user_y, user_z, L1=L1_LENGTH, L2=L2_LENGTH)
+            
+            if ik_result is not None:
+                q1, q2, q3, q4 = ik_result
+                
+                # 打印出来让我们人类看看算得对不对（把弧度转成角度看更直观）
+                print("✅ 计算成功！电机下发指令：")
+                print(f"  关节1(底座转台): {round(math.degrees(q1), 1)} 度")
+                print(f"  关节2(大臂抬角): {round(math.degrees(q2), 1)} 度")
+                print(f"  关节3(小臂屈伸): {round(math.degrees(q3), 1)} 度")
+                print(f"  关节4(手腕补偿): {round(math.degrees(q4), 1)} 度")
+                print(f"  关节5/6(锁死)  : 0.0 度 (保持手腕不歪、不自转)")
+                
+                # 6轴锁4轴的核心：5号和6号电机发 0.0，达成锁定
+                target_positions = [q1, q2, q3, q4, 0.0, 0.0]
+                
+                # 调用公司驱动，让机械臂整体协同移动过去（速度设为 0.4 比较安全慢速）
+                print("🚚 机械臂正在向目标坐标移动...")
+                arm.arm_move(
+                    target_positions[0], target_positions[1], target_positions[2],
+                    target_positions[3], target_positions[4], target_positions[5],
+                    velocity=0.4
+                )
+                print("✨ 到达指定抓取位置！")
+            else:
+                print("❌ 无法移动：由于坐标不合法，机械臂拒绝执行指令。")
+
+    except KeyboardInterrupt:
+        print("\n\n[安全退出] 接收到退出信号。")
+    finally:
+        # 无论发生什么，最后必须切断电机电源，防止烧毁和卡死
+        print("正在安全关闭所有电机电源，机械臂将放松...")
+        arm.arm.disable_all_motors()
+        print("已安全安全休眠。")
+
+if __name__ == '__main__':
+    main()
