@@ -6,7 +6,7 @@ from arm_6 import ArmManager  # 导入原本的机械臂驱动类
 # 核心大脑：根据 PDF 公式写的运动学反解函数
 # ==========================================
 #【⚠️这里的L1 L2需要替换为真实长度！！】
-def pdf_inverse_kinematics(x, y, z, L1=0.25, L2=0.20):
+def pdf_inverse_kinematics(x, y, z, L1=0.43, L2=0.43):
     """
     输入想去抓取的空间坐标 (x, y, z)，输出 1, 2, 3, 4 号电机的弧度
     :param L1: 大臂真实长度（米）
