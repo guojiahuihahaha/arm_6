@@ -209,12 +209,15 @@ def build_arm_model() -> LightweightArmIK:
     )
 
 
-def analytic_seed(target_xyz: Sequence[float], current_q_model: Sequence[float]) -> np.ndarray:
+def analytic_seed(target_xyz: Sequence[float], current_q_model: Sequence[float], elbow_down: bool = True) -> np.ndarray:
     """
     使用简化两连杆几何法生成 DLS 初值。
 
     只用于帮助数值迭代脱离全零奇异位形；最终结果仍由 DLS 求解。
     假设 0x02 的 0 rad 为竖直向上。
+    
+    参数：
+        elbow_down: True 为肘部向下配置（大小臂夹角<90°），False 为肘部向上配置
     """
     x, y, z = np.asarray(target_xyz, dtype=float)
     q = np.asarray(current_q_model, dtype=float).copy()
@@ -229,9 +232,18 @@ def analytic_seed(target_xyz: Sequence[float], current_q_model: Sequence[float])
     cos_q3 = (d2 - L1 * L1 - l2_effective * l2_effective) / (2.0 * L1 * l2_effective)
     cos_q3 = float(np.clip(cos_q3, -1.0, 1.0))
 
-    # 优先采用肘部弯曲的解，另一组解由 DLS 和当前姿态进一步修正。
-    q3 = -math.acos(cos_q3)
+    # 根据肘部配置选择解
+    # elbow_down=True: q3 为负值（肘部向下，大小臂夹角<90°）
+    # elbow_down=False: q3 为正值（肘部向上，大小臂夹角>90°）
+    if elbow_down:
+        q3 = -math.acos(cos_q3)
+    else:
+        q3 = math.acos(cos_q3)
+    
+    # 计算肩关节到目标点的连线与竖直方向的夹角
     target_angle_from_vertical = math.atan2(r, z_rel)
+    
+    # 计算肘部角度修正
     correction = math.atan2(
         l2_effective * math.sin(q3),
         L1 + l2_effective * math.cos(q3),
@@ -244,6 +256,17 @@ def analytic_seed(target_xyz: Sequence[float], current_q_model: Sequence[float])
 
     model_q_min, model_q_max = model_limits_from_motor_limits()
     return np.clip(q, model_q_min, model_q_max)
+
+
+def analytic_seed_dual(target_xyz: Sequence[float], current_q_model: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    同时生成肘部向上和肘部向下两种配置的初值。
+    
+    返回：(elbow_down_seed, elbow_up_seed)
+    """
+    seed_down = analytic_seed(target_xyz, current_q_model, elbow_down=True)
+    seed_up = analytic_seed(target_xyz, current_q_model, elbow_down=False)
+    return seed_down, seed_up
 
 
 # ============================================================
@@ -396,7 +419,61 @@ class CoordinateArmController:
         self.dry_run = dry_run
         self.allow_unmeasured_limits = allow_unmeasured_limits
 
-    def solve_xyz(self, target_xyz: Sequence[float], tool_down: bool) -> CoordinateMoveResult:
+    def _dls_solve_with_params(self, q0: np.ndarray, target: np.ndarray, mode: str, kwargs: dict, 
+                                damping: float = 0.03, max_step: float = 0.08,
+                                max_iterations: int = None, label: str = "") -> IKResult:
+        """封装DLS求解，便于复用不同参数"""
+        if max_iterations is None:
+            max_iterations = MAX_IK_ITERATIONS
+        solve_start = time.perf_counter()
+        result = self.model.solve(
+            target_position=target,
+            q0=q0,
+            mode=mode,
+            max_iterations=max_iterations,
+            position_tolerance=POSITION_TOLERANCE,
+            orientation_tolerance=math.radians(3.0),
+            damping=damping,
+            max_step=max_step,
+            verbose=True,
+            progress_interval=10,
+            **kwargs,
+        )
+        elapsed = time.perf_counter() - solve_start
+        if label:
+            print(f"{label} DLS 完成：success={result.success}，耗时={elapsed:.3f} s，"
+                  f"位置误差={result.position_error * 1000.0:.3f} mm", flush=True)
+        return result
+
+    def _try_multiple_dls(self, q0: np.ndarray, target: np.ndarray, mode: str, kwargs: dict,
+                          label: str = "") -> IKResult:
+        """尝试多组DLS参数，返回最优结果"""
+        param_sets = [
+            {"damping": 0.02, "max_step": 0.1, "max_iterations": 200},
+            {"damping": 0.03, "max_step": 0.08, "max_iterations": 150},
+            {"damping": 0.05, "max_step": 0.06, "max_iterations": 150},
+            {"damping": 0.01, "max_step": 0.12, "max_iterations": 200},
+        ]
+        
+        best_result = None
+        for i, params in enumerate(param_sets):
+            result = self._dls_solve_with_params(q0, target, mode, kwargs, label=f"{label} 尝试{i+1}", **params)
+            if result.success:
+                return result
+            if best_result is None or result.position_error < best_result.position_error:
+                best_result = result
+        
+        return best_result
+
+    def solve_xyz(self, target_xyz: Sequence[float], tool_down: bool, elbow_down: bool = True) -> CoordinateMoveResult:
+        """
+        求解目标坐标的逆运动学。
+        
+        参数：
+            elbow_down: True 优先使用肘部向下配置（试管抓取推荐），
+                       False 优先使用肘部向上配置，
+                       None 自动尝试两种配置并选择最优
+        """
         target = np.asarray(target_xyz, dtype=float)
         if target.shape != (3,) or not np.all(np.isfinite(target)):
             raise ValueError("目标坐标必须为三个有限数字：x y z")
@@ -408,68 +485,117 @@ class CoordinateArmController:
                 f"目标距离肩关节过远，超过近似最大臂展 {approximate_max_reach:.3f} m"
             )
 
-        print("\n[1/4] 正在读取当前关节角...", flush=True)
+        print("\n[1/5] 正在读取当前关节角...", flush=True)
         q_motor_start = self.hardware.read_motor_positions()
         q_model_start = motor_to_model(q_motor_start)
         print("当前电机角度(rad)：", np.round(q_motor_start, 5), flush=True)
 
-        seed_preview = analytic_seed(target, q_model_start)
-        print("解析几何初值(rad)：", np.round(seed_preview, 5), flush=True)
+        # 生成解析几何初值（肘部向下配置）
+        seed_preview = analytic_seed(target, q_model_start, elbow_down=True)
+        print("解析几何初值(肘部向下)(rad)：", np.round(seed_preview, 5), flush=True)
 
         mode = "position_tool_axis" if tool_down else "position"
         kwargs = {"target_tool_axis": [0.0, 0.0, -1.0]} if tool_down else {}
 
-        print("[2/4] 开始第一次 DLS 逆运动学求解...", flush=True)
-        solve_start = time.perf_counter()
-        result = self.model.solve(
-            target_position=target,
-            q0=q_model_start,
-            mode=mode,
-            max_iterations=MAX_IK_ITERATIONS,
-            position_tolerance=POSITION_TOLERANCE,
-            orientation_tolerance=math.radians(3.0),
-            damping=0.04,
-            max_step=0.06,
-            verbose=True,
-            progress_interval=10,
-            **kwargs,
-        )
-        print(
-            f"第一次 DLS 完成：success={result.success}，耗时={time.perf_counter() - solve_start:.3f} s，"
-            f"位置误差={result.position_error * 1000.0:.3f} mm",
-            flush=True,
-        )
-
-        # 当前姿态求解失败时，用解析几何初值重试，避免全零或伸直姿态的奇异问题。
-        if not result.success:
-            print("[3/4] 第一次未收敛，使用解析几何初值重新求解...", flush=True)
-            seed = seed_preview
-            retry_start = time.perf_counter()
-            result_retry = self.model.solve(
-                target_position=target,
-                q0=seed,
-                mode=mode,
-                max_iterations=MAX_IK_ITERATIONS,
-                position_tolerance=POSITION_TOLERANCE,
-                orientation_tolerance=math.radians(3.0),
-                damping=0.04,
-                max_step=0.06,
-                verbose=True,
-                progress_interval=10,
-                **kwargs,
+        # 策略：根据elbow_down参数选择求解策略
+        best_result = None
+        
+        if elbow_down is None:
+            # 自动模式：尝试两种配置
+            print("[2/5] 自动模式：尝试肘部向下配置...", flush=True)
+            seed_down = analytic_seed(target, q_model_start, elbow_down=True)
+            result_down = self._dls_solve_with_params(
+                seed_down, target, mode, kwargs, 
+                damping=0.03, max_step=0.08,
+                label="肘部向下"
             )
-            print(
-                f"第二次 DLS 完成：success={result_retry.success}，耗时={time.perf_counter() - retry_start:.3f} s，"
-                f"位置误差={result_retry.position_error * 1000.0:.3f} mm",
-                flush=True,
+            
+            print("[3/5] 自动模式：尝试肘部向上配置...", flush=True)
+            seed_up = analytic_seed(target, q_model_start, elbow_down=False)
+            result_up = self._dls_solve_with_params(
+                seed_up, target, mode, kwargs,
+                damping=0.03, max_step=0.08,
+                label="肘部向上"
             )
-            if result_retry.success or result_retry.position_error < result.position_error:
-                result = result_retry
+            
+            # 选择最优结果
+            if result_down.success and result_up.success:
+                # 都收敛，选择位置误差更小的
+                if result_down.position_error <= result_up.position_error:
+                    best_result = result_down
+                    print(f"[4/5] 选择肘部向下配置（误差更小：{result_down.position_error*1000:.3f} mm）", flush=True)
+                else:
+                    best_result = result_up
+                    print(f"[4/5] 选择肘部向上配置（误差更小：{result_up.position_error*1000:.3f} mm）", flush=True)
+            elif result_down.success:
+                best_result = result_down
+                print("[4/5] 选择肘部向下配置（唯一收敛解）", flush=True)
+            elif result_up.success:
+                best_result = result_up
+                print("[4/5] 选择肘部向上配置（唯一收敛解）", flush=True)
+            else:
+                # 都不收敛，选择误差更小的
+                if result_down.position_error <= result_up.position_error:
+                    best_result = result_down
+                else:
+                    best_result = result_up
+                print(f"[4/5] 两种配置均未收敛，选择误差较小的解（{best_result.position_error*1000:.3f} mm）", flush=True)
+        else:
+            # 指定配置模式
+            print(f"[2/5] 开始 DLS 逆运动学求解（{'肘部向下' if elbow_down else '肘部向上'}配置）...", flush=True)
+            seed = analytic_seed(target, q_model_start, elbow_down=elbow_down)
+            
+            # 第一次尝试：使用解析几何种子
+            result = self._dls_solve_with_params(
+                seed, target, mode, kwargs,
+                damping=0.03, max_step=0.08,
+                label="第一次"
+            )
+            
+            if result.success:
+                best_result = result
+            else:
+                # 失败时尝试从当前姿态开始
+                print(f"[3/5] 第一次未收敛，尝试从当前姿态开始求解...", flush=True)
+                result2 = self._dls_solve_with_params(
+                    q_model_start, target, mode, kwargs,
+                    damping=0.05, max_step=0.06,
+                    label="第二次(当前姿态)"
+                )
+                
+                if result2.success or result2.position_error < result.position_error:
+                    best_result = result2
+                else:
+                    # 再尝试另一种肘部配置作为后备
+                    other_elbow = not elbow_down
+                    print(f"[4/5] 尝试{'肘部向下' if other_elbow else '肘部向上'}配置作为后备...", flush=True)
+                    seed_other = analytic_seed(target, q_model_start, elbow_down=other_elbow)
+                    result3 = self._dls_solve_with_params(
+                        seed_other, target, mode, kwargs,
+                        damping=0.03, max_step=0.08,
+                        label=f"后备({'肘部向下' if other_elbow else '肘部向上'})"
+                    )
+                    
+                    if result3.success or result3.position_error < min(result.position_error, result2.position_error):
+                        best_result = result3
+                    else:
+                        best_result = result  # 使用原始结果
 
-        print("[4/4] 正在转换并检查电机目标角...", flush=True)
+        result = best_result
+
+        print("[5/5] 正在转换并检查电机目标角...", flush=True)
         q_motor_target = model_to_motor(result.q)
         validate_motor_target(q_motor_target, self.allow_unmeasured_limits or self.dry_run)
         print("目标电机角度(rad)：", np.round(q_motor_target, 5), flush=True)
+
+        # 验证大小臂夹角
+        q_model_result = result.q
+        elbow_angle = q_model_result[2]  # q3 是大小臂夹角相关
+        elbow_deg = math.degrees(abs(elbow_angle))
+        if elbow_deg > 90:
+            print(f"⚠️  警告：大小臂夹角 {elbow_deg:.1f}° > 90°，机械臂接近伸直状态", flush=True)
+            if elbow_down:
+                print("   建议：考虑调整目标位置或使用自动模式选择更优配置", flush=True)
 
         return CoordinateMoveResult(
             ik=result,
@@ -484,8 +610,9 @@ class CoordinateArmController:
         joint_speed: float,
         tool_down: bool,
         require_confirmation: bool,
+        elbow_down: bool = True,
     ) -> CoordinateMoveResult:
-        result = self.solve_xyz(target_xyz, tool_down=tool_down)
+        result = self.solve_xyz(target_xyz, tool_down=tool_down, elbow_down=elbow_down)
         ik = result.ik
 
         print("\n========== 逆运动学结果 ==========")
@@ -555,6 +682,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_JOINT_SPEED,
         help=f"关节运动速度 rad/s，默认 {DEFAULT_JOINT_SPEED}",
+    )
+    parser.add_argument(
+        "--elbow",
+        type=str,
+        choices=["down", "up", "auto"],
+        default="down",
+        help=(
+            "肘部配置选择：down=肘部向下（默认，适合试管抓取），"
+            "up=肘部向上，auto=自动选择最优配置"
+        ),
     )
     return parser.parse_args()
 
@@ -699,6 +836,10 @@ def main() -> int:
     else:
         target_xyz = [float(args.x), float(args.y), float(args.z)]
 
+    # 映射肘部配置参数
+    elbow_map = {"down": True, "up": False, "auto": None}
+    elbow_down = elbow_map[args.elbow]
+
     controller: Optional[CoordinateArmController] = None
     try:
         controller = CoordinateArmController(
@@ -713,6 +854,7 @@ def main() -> int:
             joint_speed=args.speed,
             tool_down=args.tool_down,
             require_confirmation=(REQUIRE_MOVE_CONFIRMATION and real_control),
+            elbow_down=elbow_down,
         )
         return 0
     except KeyboardInterrupt:
